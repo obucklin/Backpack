@@ -21,6 +21,7 @@
 #include "devWIFI.h"
 #include "devButton.h"
 #include "devLED.h"
+#include "SparkFunMPU9250-DMP.h"
 
 #ifdef RAPIDFIRE_BACKPACK
   #include "rapidfire.h"
@@ -52,6 +53,11 @@
   #define VRX_UART_BAUD  460800
 #endif
 
+#define fmap(value, in_min, in_max, out_min, out_max) \
+    (((value) - (in_min)) * ((out_max) - (out_min)) / ((in_max) - (in_min)) + (out_min))
+
+
+
 /////////// GLOBALS ///////////
 
 #ifdef MY_UID
@@ -60,6 +66,8 @@ uint8_t broadcastAddress[6] = {MY_UID};
 uint8_t broadcastAddress[6] = {0, 0, 0, 0, 0, 0};
 #endif
 
+MPU9250_DMP mpu;
+
 uint8_t backpackVersion[] = {LATEST_VERSION, 0};
 
 connectionState_e connectionState = starting;
@@ -67,12 +75,20 @@ unsigned long bindingStart = 0;
 unsigned long rebootTime = 0;
 
 uint8_t cachedIndex = 0;
+uint8_t mpuIntPin = 5;
 bool sendChannelChangesToVrx = false;
 bool sendHeadTrackingChangesToVrx = false;
 bool sendRTCChangesToVrx = false;
 bool gotInitialPacket = false;
 bool headTrackingEnabled = false;
+bool MPUfound = false;
 uint32_t lastSentRequest = 0;
+uint16_t ppmMinPulse = -500;
+uint16_t ppmCenter = 1500;
+uint16_t ppmMaxPulse = 500;
+
+
+
 
 device_t *ui_devices[] = {
 #ifdef PIN_LED
@@ -230,6 +246,8 @@ void ProcessMSPPacket(mspPacket_t *packet)
     break;
   case MSP_ELRS_BACKPACK_SET_HEAD_TRACKING:
     DBGLN("Processing MSP_ELRS_BACKPACK_SET_HEAD_TRACKING...");
+
+
     headTrackingEnabled = packet->readByte();
     sendHeadTrackingChangesToVrx = true;
     break;
@@ -382,6 +400,51 @@ RF_PRE_INIT()
 }
 #endif
 
+
+
+
+void process_mpu() 
+{  
+  // Check for new data in the FIFO
+  if ( mpu.fifoAvailable() )
+  {
+    // Use dmpUpdateFifo to update the ax, gx, mx, etc. values
+    if ( mpu.dmpUpdateFifo() == INV_SUCCESS)
+    {
+      // computeEulerAngles can be used -- after updating the
+      // quaternion values -- to estimate roll, pitch, and yaw
+      mpu.computeEulerAngles();
+
+
+        uint16_t ptrCRSF[3];
+        ptrCRSF[0] = fmap(mpu.yaw, ppmMinPulse + ppmCenter, ppmMaxPulse + ppmCenter, 191.0, 1792.0) + 0.5;
+        ptrCRSF[1] = fmap(mpu.pitch, ppmMinPulse + ppmCenter, ppmMaxPulse + ppmCenter, 191.0, 1792.0) + 0.5;
+        ptrCRSF[2] = fmap(mpu.roll, ppmMinPulse + ppmCenter, ppmMaxPulse + ppmCenter, 191.0, 1792.0) + 0.5;
+
+        uint8_t ptr_payload[6] = {ptrCRSF[0] & 0xFF, ptrCRSF[0] >> 8, ptrCRSF[1] & 0xFF, ptrCRSF[1] >> 8, ptrCRSF[2] & 0xFF, ptrCRSF[2] >> 8};
+
+
+
+      mspPacket_t ptr_packet;
+      ptr_packet.reset();
+      ptr_packet.makeCommand();
+      ptr_packet.function = MSP_ELRS_BACKPACK_SET_PTR;
+      ptr_packet.payloadSize = 6;
+      for (int i = 0; i< 6; i++)
+      ptr_packet.addByte(ptr_payload[i]);
+
+      sendMSPViaEspnow(&ptr_packet);
+
+    }
+  }
+}
+
+
+
+
+
+
+
 void setup()
 {
   #if !defined(HDZERO_BACKPACK)
@@ -427,14 +490,22 @@ void setup()
     Serial.begin(VRX_UART_BAUD);
   #endif
   DBGLN("Setup completed");
+
+if (mpu.begin() == INV_SUCCESS) MPUfound = true;
+if (MPUfound) mpu.dmpBegin(DMP_FEATURE_6X_LP_QUAT | DMP_FEATURE_GYRO_CAL, 50);  // Enable 6-axis quat // Use gyro calibration
+              
+
 }
 
 void loop()
 {
   uint32_t now = millis();
 
+if (MPUfound && headTrackingEnabled) process_mpu;
+
   devicesUpdate(now);
   vrxModule.Loop(now);
+
 
   #if defined(PLATFORM_ESP8266) || defined(PLATFORM_ESP32)
     // If the reboot time is set and the current time is past the reboot time then reboot.
